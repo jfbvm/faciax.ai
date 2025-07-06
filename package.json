@@ -1,0 +1,16 @@
+{
+    "name": "people.counter",
+    "version": "1.0.0",
+    "description": "To make it easy for you to get started with GitLab, here's a list of recommended next steps.",
+    "main": "index.js",
+    "scripts": {
+        "run cmd below on console": "the commands below need to be copied and executed directlly on console",
+        "create-venv": "python -m venv venv",
+        "activate-venv": "source venv/bin/activate",
+        "create-requirements": "pip3 freeze > requirements.txt | allway run in cmd",
+        "install-requirements": "pip3 install -r requirements.txt",
+        "run": "uvicorn main:app --reload --host 0.0.0.0 --port 8000"
+    },
+    "author": "",
+    "license": "ISC"
+}

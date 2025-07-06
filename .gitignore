@@ -1,0 +1,9 @@
+__pycache__/
+.vscode/
+camera_snapshots/
+data/
+venv/
+users.json
+yolo11x_segment.pt
+yolov8l.pt
+yolov8x.pt
