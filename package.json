@@ -1,8 +1,8 @@
 {
-    "name": "people.counter",
+    "name": "faciax.ai",
     "version": "1.0.0",
-    "description": "To make it easy for you to get started with GitLab, here's a list of recommended next steps.",
-    "main": "index.js",
+    "description": "Faciax facility AI core",
+    "main": "main.py",
     "scripts": {
         "run cmd below on console": "the commands below need to be copied and executed directlly on console",
         "create-venv": "python -m venv venv",
