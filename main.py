@@ -22,7 +22,7 @@ import pytz
 import subprocess
 import re
 
-conf_threshold = 0.4  # Default confidence threshold for YOLO detection
+conf_threshold = 0.25  # confidence threshold for YOLO detection (default: 0.5)
 
 # Configure logging
 logging.getLogger("ultralytics").setLevel(logging.WARNING)
@@ -72,6 +72,7 @@ active_websockets: List[WebSocket] = []
 with open("users.json", "r") as f:
     users_list = json.load(f)
 VALID_USERS = {user["username"]: user["password"] for user in users_list}
+# Store tokens as token -> username to allow multiple active sessions per user
 TOKENS = {}
 
 
@@ -83,14 +84,15 @@ def verify_token_header(authorization: str = Header(...)):
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=403, detail="Invalid or missing token format")
     token = authorization.replace("Bearer ", "")
-    if token not in TOKENS.values():
+    # Token dictionary now maps token -> username so simply check the key
+    if token not in TOKENS:
         raise HTTPException(status_code=403, detail="Invalid or missing token")
 
 @app.post("/login")
 def login(auth: AuthRequest):
     if VALID_USERS.get(auth.username) == auth.password:
         token = str(uuid.uuid4())
-        TOKENS[auth.username] = token
+        TOKENS[token] = auth.username
         return {"token": token}
     raise HTTPException(status_code=401, detail="Invalid credentials")
 
@@ -175,6 +177,10 @@ def detect_people_segmented(frame, enable_nms=True, conf_threshold=conf_threshol
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
     height, width = frame.shape[:2]
     cv2.putText(frame, now, (width - 300, height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+    # Add resolution at top-right
+    resolution_text = f"{width}x{height}"
+    cv2.putText(frame, resolution_text, (width - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
 
     return frame, count
 
@@ -409,7 +415,8 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         auth = await websocket.receive_json()
         token = auth.get("token")
-        if token not in TOKENS.values():
+        # Validate using the token dictionary keys
+        if token not in TOKENS:
             await websocket.send_json({"error": "Unauthorized"})
             await websocket.close()
             return
