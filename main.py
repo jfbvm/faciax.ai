@@ -22,7 +22,7 @@ import pytz
 import subprocess
 import re
 
-conf_threshold = 0.25  # confidence threshold for YOLO detection (default: 0.5)
+conf_threshold = 0.3  # confidence threshold for YOLO detection (default: 0.5)
 
 # Configure logging
 logging.getLogger("ultralytics").setLevel(logging.WARNING)
@@ -142,6 +142,13 @@ def detect_people_segmented(frame, enable_nms=True, conf_threshold=conf_threshol
     for r in results:
         boxes = r.boxes
         masks = r.masks
+        # Get confidence scores for each detected box
+        confidences = []
+        if boxes is not None:
+            for box in boxes:
+                # box.conf is a tensor with one value
+                conf = float(box.conf[0])
+                confidences.append(conf)
 
         if boxes is not None and masks is not None:
             selected = list(range(len(boxes)))
@@ -164,7 +171,21 @@ def detect_people_segmented(frame, enable_nms=True, conf_threshold=conf_threshol
                 b = boxes[i].xyxy[0].cpu().numpy().astype(int)
                 x1, y1, x2, y2 = b
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                cv2.putText(frame, "person", (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                conf_percent = int(confidences[i] * 100)
+                # Draw a white rectangle as background for the text
+                text = f"person: {conf_percent}%"
+                (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+                # Ensure the rectangle and text are always inside the image
+                rect_x1 = max(x1, 0)
+                rect_y1 = max(y1 - th - baseline - 4, 0)
+                rect_x2 = min(x1 + tw + 4, frame.shape[1] - 1)
+                rect_y2 = min(y1, frame.shape[0] - 1)
+                cv2.rectangle(frame, (rect_x1, rect_y1), (rect_x2, rect_y2), (255, 255, 255), -1)
+                text_x = rect_x1 + 2
+                text_y = rect_y2 - 5 if rect_y2 - 5 > rect_y1 else rect_y2 + th
+                cv2.putText(frame, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+                # Draw the text in black color
+                cv2.putText(frame, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
 
                 # # Máscara da segmentação
                 # mask = masks.data[i].cpu().numpy()
