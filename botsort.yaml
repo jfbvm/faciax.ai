@@ -1,0 +1,44 @@
+# BoT-SORT Tracker config
+tracker_type: botsort
+# Score mínimo para considerar um novo objeto rastreável
+track_high_thresh: 0.5
+
+# Score mínimo para manter um objeto que já estava sendo rastreado
+track_low_thresh: 0.1
+
+# Score mínimo para iniciar um novo ID (mais alto = menos ID falso)
+new_track_thresh: 0.7
+
+# Quantos frames manter o histórico de tracking (mais alto = IDs mais persistentes)
+track_buffer: 30
+
+# Similaridade mínima para considerar que é a mesma pessoa
+match_thresh: 0.8
+
+fuse_score: True # Whether to fuse confidence scores with the iou distances before matching
+
+# Tipo de correspondência (posição ou aparência)
+# 'iou' é mais leve, 'embedding' é mais preciso (mas requer reid)
+match_metric: iou
+
+# Tempo máximo (em frames) que um track pode "sumir" antes de ser descartado
+max_time_lost: 30
+
+# Parâmetros de NMS (non-max suppression) para remover detecções redundantes
+nms_thresh: 0.7
+
+# Use ou não suavização nos IDs (opcional, ajuda em trajetórias suaves)
+use_predictor: True
+
+# Define se deve usar detecção de oclusão (avançado, pode ajudar com cruzamentos)
+use_occlusion: True
+
+# BoT-SORT settings
+gmc_method: sparseOptFlow
+
+# ReID model related thresh
+proximity_thresh: 0.5 # minimum IoU for valid match with ReID
+appearance_thresh: 0.8 # minimum appearance similarity for ReID
+with_reid: True
+model: auto
+

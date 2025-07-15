@@ -11,6 +11,12 @@
         "install-requirements": "pip3 install -r requirements.txt",
         "run": "uvicorn main:app --reload --host 0.0.0.0 --port 8000"
     },
+    "ERROR-SOLUTIONS": [
+        {
+            "error": "ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE.",
+            "solution": "execute 'python -m pip cache purge' and try again"
+        }
+    ],
     "author": "",
     "license": "ISC"
 }

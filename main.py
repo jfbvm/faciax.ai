@@ -1,478 +1,430 @@
-import os
-import time
-import uuid
 import cv2
-import base64
-import threading
-import logging
-from typing import Dict, List
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
-from pydantic import BaseModel
-from ultralytics import YOLO
-from dotenv import load_dotenv
-from pathlib import Path
 import numpy as np
 import json
-import asyncio
-from datetime import datetime
-import pytz
+from ultralytics import YOLO
+from threading import Thread
+import time
+from flask import Flask, request, jsonify
+import os
+from functools import wraps
+import jwt  # Ensure this is PyJWT: pip install PyJWT
+from flask import send_file, Response
+import datetime
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import threading
 
-import subprocess
-import re
+# Config
+DB_HOST = "postgres"
+DB_PORT = 5432
+DB_NAME = "tracking"
+DB_USER = "postgres"
+DB_PASSWORD = "postgres"
 
-conf_threshold = 0.3  # confidence threshold for YOLO detection (default: 0.5)
+# Config
+SECRET_KEY = "d2934071d4061bbcb42e94501c71522d2245c1bbe8169f24ea2d211f490f3dbdf0599076dbe5d16095593c70e90ec3423acfa5b6e98748e5e8d3d7e5bb1178b8"
+USERS_FILE = "data/users.json"
+CONFIG_FILE = "data/config_cameras.json"
 
-# Configure logging
-logging.getLogger("ultralytics").setLevel(logging.WARNING)
+# Utilitário de token
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get("Authorization")
+        if not token or not token.startswith("Bearer "):
+            return jsonify({"erro": "Token ausente"}), 401
+        try:
+            decoded = jwt.decode(token[7:], SECRET_KEY, algorithms=["HS256"])
+            request.usuario = decoded["user"]
+        except jwt.ExpiredSignatureError:
+            return jsonify({"erro": "Token expirado"}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({"erro": "Token inválido"}), 401
+        return f(*args, **kwargs)
+    return decorated
 
-# Load environment variables
-load_dotenv()
+# Classe de rastreamento (mantida)
+class PessoaTracker:
+    def __init__(self, camera_id, model_path, linha, direcao_entrada, inatividade_max=30):
+        self.ultimo_salvamento = 0
+        self.camera_id = camera_id
+        self.model = YOLO(model_path)
+        self.model.trackers = {"default": "botsort.yaml"}
+        self.linha = linha
+        self.direcao_entrada = direcao_entrada
+        self.inatividade_max = inatividade_max
+        self.frame_count = 0
+        self.ids_ativos = {}
+        self.count_in = 0
+        self.count_out = 0
 
-# Create necessary folder
-Path("camera_snapshots").mkdir(exist_ok=True)
-Path("data").mkdir(exist_ok=True)
+    def direcao_movimento(self, prev, atual):
+        dx = atual[0] - prev[0]
+        dy = atual[1] - prev[1]
+        if abs(dy) > abs(dx):
+            return "cima_para_baixo" if dy > 0 else "baixo_para_cima"
+        else:
+            return "esquerda_para_direita" if dx > 0 else "direita_para_esquerda"
 
-# Load YOLOv8 model
-model = YOLO("yolov8x.pt")
-model_seg = YOLO("yolo11x_segment.pt")
+    def cruzou_linha(self, ponto_ant, ponto_atual):
+        x1, y1 = self.linha[0]
+        x2, y2 = self.linha[1]
+        def lado(p):
+            return np.sign((x2 - x1)*(p[1] - y1) - (y2 - y1)*(p[0] - x1))
+        return lado(ponto_ant) != lado(ponto_atual)
 
-# FastAPI instance
-app = FastAPI()
+    def salvar_frame_live(self, frame):
+        # salva miniatura otimizada também
+        agora = time.time()
+        if agora - self.ultimo_salvamento < 1:
+            return
+        self.ultimo_salvamento = agora
+        output_dir = f"public/cameras/{self.camera_id}"
+        os.makedirs(output_dir, exist_ok=True)
+        temp_path = os.path.join(output_dir, "live_temp.jpg")
+        final_path = os.path.join(output_dir, "live.jpg")
+        try:
+            qualidade = 80 if frame.shape[1] >= 1280 else 60  # qualidade maior se resolução for alta
+            cv2.imwrite(temp_path, frame, [cv2.IMWRITE_JPEG_QUALITY, qualidade])
+            os.replace(temp_path, final_path)
 
-# Allow CORS for localhost and others
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
+            # gerar miniatura 320x240
+            thumb_path = os.path.join(output_dir, "live_thumb.jpg")
+            thumb = cv2.resize(frame, (320, 240), interpolation=cv2.INTER_AREA)
+            cv2.imwrite(thumb_path, thumb, [cv2.IMWRITE_JPEG_QUALITY, 40])
+        except Exception as e:
+            print(f"[ERRO] Falha ao salvar live.jpg para {self.camera_id}: {e}")
 
-# Load persistent data from JSON files
-def load_json(file_path, default):
-    if os.path.exists(file_path):
-        with open(file_path, 'r') as f:
+    def ajustar_linha_para_resolucao(self, frame):
+        h, w = frame.shape[:2]
+        x1, y1 = self.linha[0]
+        x2, y2 = self.linha[1]
+        x1 = max(0, min(w - 1, x1))
+        x2 = max(0, min(w - 1, x2))
+        y1 = max(0, min(h - 1, y1))
+        y2 = max(0, min(h - 1, y2))
+        self.linha = [(x1, y1), (x2, y2)]
+
+    def processar_frame(self, frame):
+        self.ajustar_linha_para_resolucao(frame)
+        self.frame_count += 1
+        results = self.model.track(frame, persist=True, tracker="botsort.yaml")[0]
+        if results.boxes is not None and results.boxes.id is not None:
+            classes = results.boxes.cls.int().tolist()
+            ids = results.boxes.id.int().tolist()
+            bboxes = results.boxes.xywh.cpu().numpy()
+            for i, track_id in enumerate(ids):
+                if classes[i] != 0:  # Apenas pessoas (classe 0 no COCO)
+                    continue
+                x, y, w, h = bboxes[i]
+                centro_atual = (int(x), int(y))
+                if track_id not in self.ids_ativos:
+                    self.ids_ativos[track_id] = {"centro": centro_atual, "frame": self.frame_count, "contado": False}
+                else:
+                    centro_ant = self.ids_ativos[track_id]["centro"]
+                    contado = self.ids_ativos[track_id]["contado"]
+                    if not contado and self.cruzou_linha(centro_ant, centro_atual):
+                        direcao = self.direcao_movimento(centro_ant, centro_atual)
+                        if direcao == self.direcao_entrada:
+                            self.count_in += 1
+                        else:
+                            self.count_out += 1
+                        self.ids_ativos[track_id]["contado"] = True
+                    # Desenhar seta antes de sobrescrever o centro
+                    dx = centro_atual[0] - centro_ant[0]
+                    dy = centro_atual[1] - centro_ant[1]
+                    norm = max(1, np.hypot(dx, dy))
+                    escala = max(int(h * 0.4), 50)
+                    ponta = (int(centro_atual[0] + escala * dx / norm), int(centro_atual[1] + escala * dy / norm))
+                    cor_seta = (0, 255, 0) if self.direcao_movimento(centro_ant, centro_atual) == self.direcao_entrada else (0, 0, 255)
+                    cv2.arrowedLine(frame, centro_atual, ponta, cor_seta, 2, tipLength=0.5)
+                    self.ids_ativos[track_id]["centro"] = centro_atual
+                    self.ids_ativos[track_id]["frame"] = self.frame_count
+                # Desenhar ID e centro
+                cv2.circle(frame, centro_atual, 3, (0, 255, 0), -1)
+
+
+                cv2.putText(frame, f"ID {track_id}", (centro_atual[0] + 5, centro_atual[1] - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        inativos = [tid for tid, dados in self.ids_ativos.items() if self.frame_count - dados["frame"] > self.inatividade_max]
+        for tid in inativos:
+            del self.ids_ativos[tid]
+
+        cv2.line(frame, self.linha[0], self.linha[1], (255, 0, 0), 2)
+        cv2.putText(frame, f"In: {self.count_in}  Out: {self.count_out}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+        self.salvar_frame_live(frame)
+        return frame
+
+
+class CameraWorker(Thread):
+    def __init__(self, camera_id, rtsp_url, config):
+        super().__init__()
+        self.camera_id = camera_id
+        self.rtsp_url = rtsp_url
+        self.config = config
+        self.running = True
+        self.tracker = PessoaTracker(
+            camera_id=camera_id,
+            model_path=config["model"],
+            linha=tuple(map(tuple, config["linha"])),
+            direcao_entrada=config["direcao"],
+            inatividade_max=config.get("inatividade", 30)
+        )
+        self.cap = None
+
+    def abrir_stream(self):
+        self.cap = cv2.VideoCapture(self.rtsp_url)
+        tentativas = 0
+        while not self.cap.isOpened() and tentativas < 5:
+            print(f"[{self.tracker.camera_id}] Tentando abrir stream RTSP...")
+            time.sleep(2)
+            self.cap.open(self.rtsp_url)
+            tentativas += 1
+        return self.cap.isOpened()
+
+    def run(self):
+        if not self.abrir_stream():
+            print(f"[{self.tracker.camera_id}] Falha ao conectar no stream RTSP")
+            return
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                print(f"[{self.tracker.camera_id}] Frame inválido. Tentando reconectar...")
+                self.cap.release()
+                time.sleep(2)
+                if not self.abrir_stream():
+                    print(f"[{self.tracker.camera_id}] Reconexão falhou. Encerrando thread.")
+                    break
+                continue
+            frame = self.tracker.processar_frame(frame)
+            cv2.imshow(f"Camera {self.tracker.camera_id}", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                self.running = False
+        self.cap.release()
+        cv2.destroyAllWindows()
+
+    def parar(self):
+        self.running = False
+
+    def resultados(self):
+        return self.tracker.exportar_json()
+
+# Flask
+app = Flask(__name__)
+workers = {}
+
+# Carrega usuários e câmeras
+def carregar_usuarios():
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE) as f:
             return json.load(f)
-    return default
+    return []
 
-def save_json(file_path, data):
-    with open(file_path, 'w') as f:
-        json.dump(data, f, indent=2)
+def carregar_config():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    return {}
 
-camera_db: Dict[str, Dict] = load_json("data/camera_db.json", {})
-camera_threads: Dict[str, threading.Thread] = {}
-camera_stop_flags: Dict[str, threading.Event] = {}
-person_counts: Dict[str, int] = load_json("data/person_counts.json", {})
+def salvar_config(config):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
 
-active_websockets: List[WebSocket] = []
+usuarios = carregar_usuarios()
+camera_configs = carregar_config()
 
-# Load users from local JSON file
-with open("users.json", "r") as f:
-    users_list = json.load(f)
-VALID_USERS = {user["username"]: user["password"] for user in users_list}
-# Store tokens as token -> username to allow multiple active sessions per user
-TOKENS = {}
+# Inicia câmeras existentes
+for camera_id, cam_cfg in camera_configs.items():
+    worker = CameraWorker(camera_id, cam_cfg["rtsp"], cam_cfg)
+    worker.start()
+    workers[camera_id] = worker
 
+@app.route("/login", methods=["POST"])
+def login():
+    dados = request.json
+    username = dados.get("username")
+    password = dados.get("password")
 
-class AuthRequest(BaseModel):
-    username: str
-    password: str
+    for user in usuarios:
+        if user["username"] == username and user["password"] == password:
+            token = jwt.encode({
+                "user": username,
+                "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+            }, SECRET_KEY, algorithm="HS256")
+            # PyJWT returns bytes in v2+, so decode to str
+            if isinstance(token, bytes):
+                token = token.decode('utf-8')
+            return jsonify({"token": token})
 
-def verify_token_header(authorization: str = Header(...)):
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=403, detail="Invalid or missing token format")
-    token = authorization.replace("Bearer ", "")
-    # Token dictionary now maps token -> username so simply check the key
-    if token not in TOKENS:
-        raise HTTPException(status_code=403, detail="Invalid or missing token")
+    return jsonify({"erro": "Usuário ou senha inválidos"}), 401
 
-@app.post("/login")
-def login(auth: AuthRequest):
-    if VALID_USERS.get(auth.username) == auth.password:
-        token = str(uuid.uuid4())
-        TOKENS[token] = auth.username
-        return {"token": token}
-    raise HTTPException(status_code=401, detail="Invalid credentials")
+@app.route("/cameras", methods=["GET"])
+@token_required
+def listar_cameras():
+    return jsonify(camera_configs)
 
-@app.get("/")
-def root():
-    return {"status": "Camera Processing API running"}
+@app.route("/cameras", methods=["POST"])
+@token_required
+def adicionar_camera():
+    data = request.json
+    camera_id = data["camera_id"]
+    if camera_id in workers:
+        return jsonify({"erro": "Camera já existe"}), 400
+    camera_configs[camera_id] = data
+    salvar_config(camera_configs)
+    worker = CameraWorker(camera_id, data["rtsp"], data)
+    worker.start()
+    workers[camera_id] = worker
+    return jsonify({"mensagem": "Camera adicionada"})
 
-# Model for adding streams
-class StreamInput(BaseModel):
-    url: str
+@app.route("/cameras/<camera_id>", methods=["PUT"])
+@token_required
+def editar_camera(camera_id):
+    if camera_id not in workers:
+        return jsonify({"erro": "Camera não encontrada"}), 404
+    nova_config = request.json
+    atual_rtsp = camera_configs[camera_id]["rtsp"]
+    camera_configs[camera_id] = nova_config
+    salvar_config(camera_configs)
+    if nova_config["rtsp"] != atual_rtsp:
+        workers[camera_id].parar()
+        workers[camera_id].join()
+        worker = CameraWorker(camera_id, nova_config["rtsp"], nova_config)
+        worker.start()
+        workers[camera_id] = worker
+    return jsonify({"mensagem": "Camera atualizada"})
 
-def iou(box1, box2):
-    x1 = max(box1[0], box2[0])
-    y1 = max(box1[1], box2[1])
-    x2 = min(box1[2], box2[2])
-    y2 = min(box1[3], box2[3])
+@app.route("/cameras/<camera_id>", methods=["DELETE"])
+@token_required
+def remover_camera(camera_id):
+    if camera_id not in workers:
+        return jsonify({"erro": "Camera não encontrada"}), 404
+    workers[camera_id].parar()
+    workers[camera_id].join()
+    del workers[camera_id]
+    if camera_id in camera_configs:
+        del camera_configs[camera_id]
+        salvar_config(camera_configs)
+    return jsonify({"mensagem": "Camera removida"})
 
-    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
-    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
-
-    union_area = box1_area + box2_area - inter_area
-    return inter_area / union_area if union_area > 0 else 0
+@app.route("/cameras/<camera_id>/imagem", methods=["GET"])
+@token_required
+def obter_imagem(camera_id):
+    path = f"public/cameras/{camera_id}/live.jpg"
+    if os.path.exists(path):
+        return send_file(path, mimetype='image/jpeg')
+    return jsonify({"erro": "Imagem não encontrada"}), 404
 
 """
-detect_people_segmented(frame, enable_nms=True, conf_threshold=0.5)
+Endpoint to retrieve tracking data from the database.
 
-This function performs person detection using the YOLOv8 segmentation model. It detects human figures in the given frame, draws bounding boxes and segmentation masks for each detected person, and returns the annotated frame along with the total count of people detected.
-
-Parameters:
-- frame:
-    The input image (as a NumPy array) to process.
-- enable_nms (bool):
-    To avoid detection of same person multiple times.
-    Whether to apply Non-Maximum Suppression (NMS) manually to reduce overlapping detections.
-- conf_threshold (float):
-    Confidence threshold for YOLO detection.
+GET /tracking
+Query Parameters:
+    camera_id (str, optional): Filter results by camera ID.
+    limit (int, optional): Maximum number of records to return (default: 100).
 
 Returns:
-- frame: The output image with annotations.
-- count: The number of people detected in the frame.
+    JSON array of tracking data records, ordered by timestamp descending.
+    If an error occurs, returns a JSON object with an "error" message and HTTP status 500.
+
+Usage:
+    Send a GET request to /tracking with optional query parameters 'camera_id' and 'limit'.
+    Example: GET /tracking?camera_id=CAM123&limit=50
+    Requires authentication via token.
 """
-def detect_people_segmented(frame, enable_nms=True, conf_threshold=conf_threshold):
-    results = model_seg.predict(frame, conf=conf_threshold, classes=[0], task="segment")
-    count = 0
-
-    for r in results:
-        boxes = r.boxes
-        masks = r.masks
-        # Get confidence scores for each detected box
-        confidences = []
-        if boxes is not None:
-            for box in boxes:
-                # box.conf is a tensor with one value
-                conf = float(box.conf[0])
-                confidences.append(conf)
-
-        if boxes is not None and masks is not None:
-            selected = list(range(len(boxes)))
-
-            if enable_nms:
-                selected = []
-                used = [False] * len(boxes)
-                for i in range(len(boxes)):
-                    if used[i]:
-                        continue
-                    selected.append(i)
-                    for j in range(i + 1, len(boxes)):
-                        if iou(boxes[i].xyxy[0].cpu().numpy(), boxes[j].xyxy[0].cpu().numpy()) > 0.5:
-                            used[j] = True
-
-            count = len(selected)
-
-            for i in selected:
-                # Caixa delimitadora
-                b = boxes[i].xyxy[0].cpu().numpy().astype(int)
-                x1, y1, x2, y2 = b
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                conf_percent = int(confidences[i] * 100)
-                # Draw a white rectangle as background for the text
-                text = f"person: {conf_percent}%"
-                (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-                # Ensure the rectangle and text are always inside the image
-                rect_x1 = max(x1, 0)
-                rect_y1 = max(y1 - th - baseline - 4, 0)
-                rect_x2 = min(x1 + tw + 4, frame.shape[1] - 1)
-                rect_y2 = min(y1, frame.shape[0] - 1)
-                cv2.rectangle(frame, (rect_x1, rect_y1), (rect_x2, rect_y2), (255, 255, 255), -1)
-                text_x = rect_x1 + 2
-                text_y = rect_y2 - 5 if rect_y2 - 5 > rect_y1 else rect_y2 + th
-                cv2.putText(frame, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
-                # Draw the text in black color
-                cv2.putText(frame, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
-
-                # # Máscara da segmentação
-                # mask = masks.data[i].cpu().numpy()
-                # colored_mask = (mask * 255).astype('uint8')
-                # contours, _ = cv2.findContours(colored_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                # cv2.drawContours(frame, contours, -1, (0, 255, 0), 2)
-
-    # Adicionar data e hora no canto inferior direito
-    tz = pytz.timezone("America/Sao_Paulo")
-    now = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-    height, width = frame.shape[:2]
-    cv2.putText(frame, now, (width - 300, height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-    # Add resolution at top-right
-    resolution_text = f"{width}x{height}"
-    cv2.putText(frame, resolution_text, (width - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-
-    return frame, count
-
-def detect_people(frame, conf_threshold=conf_threshold):
-    results = model(frame)
-    count = 0
-    for r in results:
-        for box in r.boxes:
-            if int(box.cls[0]) == 0 and box.conf[0] >= conf_threshold:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                count += 1
-    return frame, count
-
-async def broadcast_to_websockets(payload):
-    for ws in active_websockets[:]:
-        try:
-            await ws.send_json(payload)
-        except Exception:
-            active_websockets.remove(ws)
-
-def get_video_resolution(url):
+@app.route("/tracking", methods=["GET"])
+@token_required
+def get_tracking_data():
+    camera_id = request.args.get("camera_id")
+    limit = int(request.args.get("limit", 100))
     try:
-        command = [
-            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
-            '-show_entries', 'stream=width,height',
-            '-of', 'csv=p=0', url
-        ]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
-        if result.returncode == 0:
-            width, height = map(int, result.stdout.strip().split(','))
-            return width, height
+        conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD)
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        if camera_id:
+            cur.execute("SELECT * FROM tracking_data WHERE camera_id = %s ORDER BY timestamp DESC LIMIT %s", (camera_id, limit))
+        else:
+            cur.execute("SELECT * FROM tracking_data ORDER BY timestamp DESC LIMIT %s", (limit,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify(rows)
     except Exception as e:
-        print(f"FFprobe error: {e}")
-    return 1920, 1080  # fallback default
+        return jsonify({"error": str(e)}), 500
 
-def read_frame_ffmpeg(url):
-    width, height = get_video_resolution(url)
-    command = [
-        'ffmpeg',
-        '-i', url,
-        '-loglevel', 'quiet',
-        '-f', 'image2pipe',
-        '-pix_fmt', 'bgr24',
-        '-vcodec', 'rawvideo',
-        '-frames:v', '1',
-        'pipe:1'
-    ]
-    try:
-        pipe = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        raw_image = pipe.stdout.read(width * height * 3) # type: ignore
-        pipe.stdout.close() # type: ignore
-        pipe.wait()
-        if raw_image:
-            frame = np.frombuffer(raw_image, dtype=np.uint8).reshape((height, width, 3)).copy()
-            return True, frame
-    except Exception as e:
-        print(f"FFmpeg error: {e}")
-    return False, None
-
-def process_camera_ffmpeg(camera_id: str, url: str, stop_event: threading.Event):
-    url = url.strip()
-    ret, frame = False, None
-
-    while not stop_event.is_set():
-        for _ in range(3):  # Retry reading the frame up to 3 times
-            ret, frame = read_frame_ffmpeg(url)
-            if ret:
-                break
-            time.sleep(0.5)  # small delay before retrying
-
-        if not ret:
-            print(f"Camera {camera_id}: Stream unresponsive, retrying.")
-            time.sleep(2)
-            continue
-
-        frame, count = detect_people_segmented(frame)
-        snapshot_path = f"camera_snapshots/{camera_id}.jpg"
-        if frame is not None:
-            cv2.imwrite(snapshot_path, frame)
-        person_counts[camera_id] = count
-        save_json("data/person_counts.json", person_counts)
-
-        # Broadcast to all connected WebSocket clients
-        # OLD CODE
-        # _, buffer = cv2.imencode(".jpg", frame)
-        # b64_result = base64.b64encode(buffer).decode("utf-8")
-        # asyncio.run(broadcast_to_websockets({"camera_id": camera_id, "person_count": count, "image_base64": b64_result}))
-        if frame is not None:
-            success, buffer = cv2.imencode(".jpg", frame)
-            if success:
-                b64_result = base64.b64encode(buffer).decode("utf-8")
-                asyncio.run(broadcast_to_websockets({"camera_id": camera_id, "person_count": count, "image_base64": b64_result}))
+@app.route("/cameras/<camera_id>/thumb", methods=["GET"])
+@token_required
+def obter_thumbnail(camera_id):
+    path = f"public/cameras/{camera_id}/live_thumb.jpg"
+    if os.path.exists(path):
+        return send_file(path, mimetype='image/jpeg')
+    return jsonify({"erro": "Miniatura não encontrada"}), 404
 
 
-        time.sleep(5)  # Add a fixed interval of 5 seconds between processed frames
 
-def process_camera_cv2(camera_id: str, url: str, stop_event: threading.Event):
-    url = url.strip()
-    cap = cv2.VideoCapture(url)
-    if not cap.isOpened():
-        print(f"Failed to open camera: {url}")
-        return
 
-    while not stop_event.is_set():
-        for _ in range(3):  # Retry reading the frame up to 3 times
-            cap = cv2.VideoCapture(url)
-            ret, frame = cap.read()
-            if ret:
-                break
-            time.sleep(0.5)  # small delay before retrying
 
-        if not ret:
-            print(f"Camera {camera_id}: Stream unresponsive, attempting to reopen.")
-            cap.release()
-            time.sleep(2)
-            cap = cv2.VideoCapture(url)
-            if not cap.isOpened():
-                print(f"Camera {camera_id}: Failed to reopen stream.")
-                continue
-            print(f"Camera {camera_id}: Stream reopened.")
-            continue
+def init_db():
+    conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD)
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute("CREATE DATABASE tracking")
+    cur.close()
+    conn.close()
+    time.sleep(1)
 
-        frame, count = detect_people_segmented(frame)
-        snapshot_path = f"camera_snapshots/{camera_id}.jpg"
-        cv2.imwrite(snapshot_path, frame)
-        person_counts[camera_id] = count
-        save_json("data/person_counts.json", person_counts)
+def ensure_schema():
+    with psycopg2.connect(host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tracking_data (
+                    id SERIAL PRIMARY KEY,
+                    camera_id TEXT NOT NULL,
+                    timestamp TIMESTAMPTZ NOT NULL,
+                    count_in INTEGER NOT NULL,
+                    count_out INTEGER NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS system_log (
+                    id SERIAL PRIMARY KEY,
+                    event TEXT NOT NULL,
+                    camera_id TEXT,
+                    timestamp TIMESTAMPTZ DEFAULT NOW(),
+                    details JSONB
+                )
+            """)
 
-        # Broadcast to all connected WebSocket clients
-        _, buffer = cv2.imencode(".jpg", frame)
-        b64_result = base64.b64encode(buffer).decode("utf-8")
-        asyncio.run(broadcast_to_websockets({"camera_id": camera_id, "person_count": count, "image_base64": b64_result}))
+def log_tracking(camera_id, count_in, count_out):
+    with psycopg2.connect(host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO tracking_data (camera_id, timestamp, count_in, count_out)
+                VALUES (%s, NOW(), %s, %s)
+                """,
+                (camera_id, count_in, count_out)
+            )
 
-        cap.release()
-        time.sleep(5)  # Add a fixed interval of 5 seconds between processed frames
-
-    cap.release()
-
-def register_camera_stream(url: str) -> Dict[str, str]:
-    cam_id = str(uuid.uuid4())
-    if cam_id in camera_db:
-        raise HTTPException(status_code=400, detail="Camera already exists")
-
-    camera_db[cam_id] = {"url": url}
-    save_json("data/camera_db.json", camera_db)
-    stop_event = threading.Event()
-    camera_stop_flags[cam_id] = stop_event
-    thread = threading.Thread(target=process_camera_ffmpeg, args=(cam_id, url, stop_event), daemon=True)
-    camera_threads[cam_id] = thread
-    thread.start()
-    return {"id": cam_id, "url": url}
-
-@app.post("/add_stream", dependencies=[Depends(verify_token_header)])
-def add_stream(stream: StreamInput):
-    return register_camera_stream(stream.url)
-
-@app.delete("/delete_stream/{cam_id}", dependencies=[Depends(verify_token_header)])
-def delete_stream(cam_id: str):
-    if cam_id not in camera_db:
-        raise HTTPException(status_code=404, detail="Camera not found")
-
-    camera_stop_flags[cam_id].set()
-    del camera_db[cam_id]
-    del camera_threads[cam_id]
-    del camera_stop_flags[cam_id]
-    person_counts.pop(cam_id, None)
-    save_json("data/camera_db.json", camera_db)
-    save_json("data/person_counts.json", person_counts)
-    return {"message": "Camera deleted"}
-
-@app.get("/list_streams", dependencies=[Depends(verify_token_header)])
-def list_streams():
-    return camera_db
-
-@app.get("/count_people/{cam_id}", dependencies=[Depends(verify_token_header)])
-def count_people(cam_id: str):
-    if cam_id not in camera_db:
-        raise HTTPException(status_code=404, detail="Camera not found")
-    return {"camera_id": cam_id, "person_count": person_counts.get(cam_id, 0)}
-
-@app.get("/recognition/{cam_id}", dependencies=[Depends(verify_token_header)])
-def count_people(cam_id: str):
-    if cam_id not in camera_db:
-        raise HTTPException(status_code=404, detail="Camera not found")
-    return {"camera_id": cam_id, "person_count": person_counts.get(cam_id, 0)}
-
-@app.get("/snapshot/{cam_id}", dependencies=[Depends(verify_token_header)])
-def get_snapshot(cam_id: str, return_type: str = "base64"):
-    path = f"camera_snapshots/{cam_id}.jpg"
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Snapshot not found")
-
-    if return_type == "image":
-        return FileResponse(path, media_type="image/jpeg")
-
-    with open(path, "rb") as img_file:
-        img_bytes = img_file.read()
-        return {"image_base64": base64.b64encode(img_bytes).decode("utf-8")}
-
-@app.post("/detect_base64", dependencies=[Depends(verify_token_header)])
-def detect_base64_image(file: UploadFile = File(None), base64_str: str = Form(None), compressed_base64: str = Form(None), return_type: str = "base64"):
-    if file:
-        image_data = file.file.read()
-    elif base64_str:
-        image_data = base64.b64decode(base64_str)
-    elif compressed_base64:
-        image_data = base64.b64decode(compressed_base64)
-    else:
-        raise HTTPException(status_code=400, detail="No image file or base64 string provided")
-
-    nparr = np.frombuffer(image_data, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    frame, count = detect_people_segmented(img)
-    _, buffer = cv2.imencode(".jpg", frame)
-
-    if return_type == "image":
-        temp_path = "camera_snapshots/temp_detect.jpg"
-        with open(temp_path, "wb") as f:
-            f.write(buffer)
-        return FileResponse(temp_path, media_type="image/jpeg")
-
-    if return_type == "count":
-        return {"person_count": count}
-
-    b64_result = base64.b64encode(buffer).decode("utf-8")
-    return {"person_count": count, "image_base64": b64_result}
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    try:
-        auth = await websocket.receive_json()
-        token = auth.get("token")
-        # Validate using the token dictionary keys
-        if token not in TOKENS:
-            await websocket.send_json({"error": "Unauthorized"})
-            await websocket.close()
-            return
-
-        active_websockets.append(websocket)
-        await websocket.send_json({"status": "connected"})
-
+def start_periodic_db_logger(trackers):
+    def loop():
         while True:
-            data = await websocket.receive_json()
-            image_data = None
-            if 'base64_str' in data:
-                image_data = base64.b64decode(data['base64_str'])
-            elif 'compressed_base64' in data:
-                image_data = base64.b64decode(data['compressed_base64'])
-            else:
-                await websocket.send_json({"error": "No valid image data provided"})
-                continue
-
-            nparr = np.frombuffer(image_data, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            frame, count = detect_people_segmented(img)
-            _, buffer = cv2.imencode(".jpg", frame)
-            b64_result = base64.b64encode(buffer).decode("utf-8")
-            await websocket.send_json({"person_count": count, "image_base64": b64_result})
-
-    except WebSocketDisconnect:
-        if websocket in active_websockets:
-            active_websockets.remove(websocket)
-        print("WebSocket disconnected")
+            time.sleep(60)
+            for tracker in trackers.values():
+                log_tracking(tracker.camera_id, tracker.count_in, tracker.count_out)
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
 
 
-# Reinitialize existing streams from saved camera_db
-for cam_id, cam_data in camera_db.items():
-    stop_event = threading.Event()
-    camera_stop_flags[cam_id] = stop_event
-    thread = threading.Thread(target=process_camera_ffmpeg, args=(cam_id, cam_data["url"], stop_event), daemon=True)
-    camera_threads[cam_id] = thread
-    thread.start()
+if __name__ == "__main__":
+    try:
+        psycopg2.connect(host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD).close()
+    except:
+        init_db()
+    ensure_schema()
+    start_periodic_db_logger(workers)
+
+    os.makedirs("data", exist_ok=True)
+    app.run(host="0.0.0.0", port=8000, threaded=True)

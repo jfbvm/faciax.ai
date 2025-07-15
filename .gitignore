@@ -7,3 +7,7 @@ users.json
 yolo11x_segment.pt
 yolov8l.pt
 yolov8x.pt
+/config
+/models
+/public
+/ultralytics
