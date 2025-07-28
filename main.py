@@ -13,6 +13,8 @@ import datetime
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import threading
+import base64
+import sys
 
 # Config
 DB_HOST = "postgres"
@@ -22,28 +24,28 @@ DB_USER = "postgres"
 DB_PASSWORD = "postgres"
 
 # Config
-SECRET_KEY = "d2934071d4061bbcb42e94501c71522d2245c1bbe8169f24ea2d211f490f3dbdf0599076dbe5d16095593c70e90ec3423acfa5b6e98748e5e8d3d7e5bb1178b8"
+SECRET_KEY = "SECRET_KEY"
 USERS_FILE = "data/users.json"
 CONFIG_FILE = "data/config_cameras.json"
 
-# Utilitário de token
+# Token utility
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         token = request.headers.get("Authorization")
         if not token or not token.startswith("Bearer "):
-            return jsonify({"erro": "Token ausente"}), 401
+            return jsonify({"erro": "Missing token"}), 401
         try:
             decoded = jwt.decode(token[7:], SECRET_KEY, algorithms=["HS256"])
             request.usuario = decoded["user"]
         except jwt.ExpiredSignatureError:
-            return jsonify({"erro": "Token expirado"}), 401
+            return jsonify({"erro": "Expired token"}), 401
         except jwt.InvalidTokenError:
-            return jsonify({"erro": "Token inválido"}), 401
+            return jsonify({"erro": "Invalid token"}), 401
         return f(*args, **kwargs)
     return decorated
 
-# Classe de rastreamento (mantida)
+# Tracking class (maintained)
 class PessoaTracker:
     def __init__(self, camera_id, model_path, linha, direcao_entrada, inatividade_max=30):
         self.ultimo_salvamento = 0
@@ -74,7 +76,7 @@ class PessoaTracker:
         return lado(ponto_ant) != lado(ponto_atual)
 
     def salvar_frame_live(self, frame):
-        # salva miniatura otimizada também
+        # save optimized thumbnail as well
         agora = time.time()
         if agora - self.ultimo_salvamento < 1:
             return
@@ -84,16 +86,20 @@ class PessoaTracker:
         temp_path = os.path.join(output_dir, "live_temp.jpg")
         final_path = os.path.join(output_dir, "live.jpg")
         try:
-            qualidade = 80 if frame.shape[1] >= 1280 else 60  # qualidade maior se resolução for alta
-            cv2.imwrite(temp_path, frame, [cv2.IMWRITE_JPEG_QUALITY, qualidade])
-            os.replace(temp_path, final_path)
+            qualidade = 60 if frame.shape[1] >= 1280 else 40  # higher quality if resolution is high
+            safe_frame = frame.copy() # make a copy to avoid loss of quality when saving
+            cv2.imwrite(final_path, safe_frame, [
+                cv2.IMWRITE_JPEG_QUALITY, qualidade,
+                cv2.IMWRITE_JPEG_OPTIMIZE, 1
+            ])
+            # os.replace(temp_path, final_path)
 
-            # gerar miniatura 320x240
+            # generate 320x240 thumbnail
             thumb_path = os.path.join(output_dir, "live_thumb.jpg")
             thumb = cv2.resize(frame, (320, 240), interpolation=cv2.INTER_AREA)
             cv2.imwrite(thumb_path, thumb, [cv2.IMWRITE_JPEG_QUALITY, 40])
         except Exception as e:
-            print(f"[ERRO] Falha ao salvar live.jpg para {self.camera_id}: {e}")
+            print(f"[ERROR] Failed to save live.jpg for {self.camera_id}: {e}")
 
     def ajustar_linha_para_resolucao(self, frame):
         h, w = frame.shape[:2]
@@ -114,7 +120,7 @@ class PessoaTracker:
             ids = results.boxes.id.int().tolist()
             bboxes = results.boxes.xywh.cpu().numpy()
             for i, track_id in enumerate(ids):
-                if classes[i] != 0:  # Apenas pessoas (classe 0 no COCO)
+                if classes[i] != 0:  # Only people (class 0 in COCO)
                     continue
                 x, y, w, h = bboxes[i]
                 centro_atual = (int(x), int(y))
@@ -130,7 +136,7 @@ class PessoaTracker:
                         else:
                             self.count_out += 1
                         self.ids_ativos[track_id]["contado"] = True
-                    # Desenhar seta antes de sobrescrever o centro
+                    # Draw arrow before overwriting the center
                     dx = centro_atual[0] - centro_ant[0]
                     dy = centro_atual[1] - centro_ant[1]
                     norm = max(1, np.hypot(dx, dy))
@@ -140,12 +146,10 @@ class PessoaTracker:
                     cv2.arrowedLine(frame, centro_atual, ponta, cor_seta, 2, tipLength=0.5)
                     self.ids_ativos[track_id]["centro"] = centro_atual
                     self.ids_ativos[track_id]["frame"] = self.frame_count
-                # Desenhar ID e centro
+                # Draw ID and center
                 cv2.circle(frame, centro_atual, 3, (0, 255, 0), -1)
 
-
-                cv2.putText(frame, f"ID {track_id}", (centro_atual[0] + 5, centro_atual[1] - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                cv2.putText(frame, f"ID {track_id}", (centro_atual[0] + 5, centro_atual[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         inativos = [tid for tid, dados in self.ids_ativos.items() if self.frame_count - dados["frame"] > self.inatividade_max]
         for tid in inativos:
@@ -176,10 +180,12 @@ class CameraWorker(Thread):
         self.cap = None
 
     def abrir_stream(self):
-        self.cap = cv2.VideoCapture(self.rtsp_url)
+        # Need to set environment variable for OpenCV FFMPEG because by default, OpenCV tries UDP → faster, but very unstable on VPS networks
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+        self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
         tentativas = 0
         while not self.cap.isOpened() and tentativas < 5:
-            print(f"[{self.tracker.camera_id}] Tentando abrir stream RTSP...")
+            print(f"[{self.tracker.camera_id}] Trying to open RTSP stream...")
             time.sleep(2)
             self.cap.open(self.rtsp_url)
             tentativas += 1
@@ -187,22 +193,33 @@ class CameraWorker(Thread):
 
     def run(self):
         if not self.abrir_stream():
-            print(f"[{self.tracker.camera_id}] Falha ao conectar no stream RTSP")
+            print(f"[{self.tracker.camera_id}] Failed to connect to RTSP stream")
+            self.abrir_stream()
             return
         while self.running:
             ret, frame = self.cap.read()
             if not ret:
-                print(f"[{self.tracker.camera_id}] Frame inválido. Tentando reconectar...")
+                print(f"[{self.tracker.camera_id}] Invalid frame. Trying to reconnect...")
                 self.cap.release()
                 time.sleep(2)
                 if not self.abrir_stream():
-                    print(f"[{self.tracker.camera_id}] Reconexão falhou. Encerrando thread.")
-                    break
+                    print(f"[{self.tracker.camera_id}] Reconnection failed. Ending thread.")
+                    self.abrir_stream()
+                    # break
                 continue
             frame = self.tracker.processar_frame(frame)
-            cv2.imshow(f"Camera {self.tracker.camera_id}", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                self.running = False
+            # Read --env parameter from command line arguments
+            env = None
+            for i, arg in enumerate(sys.argv):
+                if arg == "--env" and i + 1 < len(sys.argv):
+                    env = sys.argv[i + 1]
+                    if env == "local":
+                        # Show the frame in a window for local testing
+                        resized_frame = cv2.resize(frame, (800, 600), interpolation=cv2.INTER_AREA)
+                        cv2.imshow(f"Camera {self.tracker.camera_id}", resized_frame)
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            self.running = False
+                    break
         self.cap.release()
         cv2.destroyAllWindows()
 
@@ -216,7 +233,7 @@ class CameraWorker(Thread):
 app = Flask(__name__)
 workers = {}
 
-# Carrega usuários e câmeras
+# Load users and cameras
 def carregar_usuarios():
     if os.path.exists(USERS_FILE):
         with open(USERS_FILE) as f:
@@ -236,7 +253,7 @@ def salvar_config(config):
 usuarios = carregar_usuarios()
 camera_configs = carregar_config()
 
-# Inicia câmeras existentes
+# Start existing cameras
 for camera_id, cam_cfg in camera_configs.items():
     worker = CameraWorker(camera_id, cam_cfg["rtsp"], cam_cfg)
     worker.start()
@@ -259,7 +276,7 @@ def login():
                 token = token.decode('utf-8')
             return jsonify({"token": token})
 
-    return jsonify({"erro": "Usuário ou senha inválidos"}), 401
+    return jsonify({"erro": "Invalid username or password"}), 401
 
 @app.route("/cameras", methods=["GET"])
 @token_required
@@ -272,19 +289,19 @@ def adicionar_camera():
     data = request.json
     camera_id = data["camera_id"]
     if camera_id in workers:
-        return jsonify({"erro": "Camera já existe"}), 400
+        return jsonify({"erro": "Camera already exists"}), 400
     camera_configs[camera_id] = data
     salvar_config(camera_configs)
     worker = CameraWorker(camera_id, data["rtsp"], data)
     worker.start()
     workers[camera_id] = worker
-    return jsonify({"mensagem": "Camera adicionada"})
+    return jsonify({"mensagem": "Camera added"})
 
 @app.route("/cameras/<camera_id>", methods=["PUT"])
 @token_required
 def editar_camera(camera_id):
     if camera_id not in workers:
-        return jsonify({"erro": "Camera não encontrada"}), 404
+        return jsonify({"erro": "Camera not found"}), 404
     nova_config = request.json
     atual_rtsp = camera_configs[camera_id]["rtsp"]
     camera_configs[camera_id] = nova_config
@@ -295,20 +312,20 @@ def editar_camera(camera_id):
         worker = CameraWorker(camera_id, nova_config["rtsp"], nova_config)
         worker.start()
         workers[camera_id] = worker
-    return jsonify({"mensagem": "Camera atualizada"})
+    return jsonify({"mensagem": "Camera updated"})
 
 @app.route("/cameras/<camera_id>", methods=["DELETE"])
 @token_required
 def remover_camera(camera_id):
     if camera_id not in workers:
-        return jsonify({"erro": "Camera não encontrada"}), 404
+        return jsonify({"erro": "Camera not found"}), 404
     workers[camera_id].parar()
     workers[camera_id].join()
     del workers[camera_id]
     if camera_id in camera_configs:
         del camera_configs[camera_id]
         salvar_config(camera_configs)
-    return jsonify({"mensagem": "Camera removida"})
+    return jsonify({"mensagem": "Camera removed"})
 
 @app.route("/cameras/<camera_id>/imagem", methods=["GET"])
 @token_required
@@ -316,7 +333,30 @@ def obter_imagem(camera_id):
     path = f"public/cameras/{camera_id}/live.jpg"
     if os.path.exists(path):
         return send_file(path, mimetype='image/jpeg')
-    return jsonify({"erro": "Imagem não encontrada"}), 404
+    return jsonify({"erro": "Image not found"}), 404
+
+@app.route("/cameras/<camera_id>/thumb", methods=["GET"])
+@token_required
+def obter_thumbnail(camera_id):
+    path = f"public/cameras/{camera_id}/live_thumb.jpg"
+    if os.path.exists(path):
+        return send_file(path, mimetype='image/jpeg')
+    return jsonify({"erro": "Thumbnail not found"}), 404
+
+@app.route("/cameras/<camera_id>/base64", methods=["GET"])
+@token_required
+def obter_imagem_base64(camera_id):
+    path = f"public/cameras/{camera_id}/live.jpg"
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as image_file:
+                encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                return jsonify({"image": encoded_string, "format": "jpeg"})
+        except Exception as e:
+            return jsonify({"erro": f"Error processing image: {str(e)}"}), 500
+    return jsonify({"erro": "Image not found"}), 404
+
+
 
 """
 Endpoint to retrieve tracking data from the database.
@@ -353,18 +393,6 @@ def get_tracking_data():
         return jsonify(rows)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-@app.route("/cameras/<camera_id>/thumb", methods=["GET"])
-@token_required
-def obter_thumbnail(camera_id):
-    path = f"public/cameras/{camera_id}/live_thumb.jpg"
-    if os.path.exists(path):
-        return send_file(path, mimetype='image/jpeg')
-    return jsonify({"erro": "Miniatura não encontrada"}), 404
-
-
-
-
 
 def init_db():
     conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD)
@@ -419,12 +447,15 @@ def start_periodic_db_logger(trackers):
 
 
 if __name__ == "__main__":
+    print("Starting Faciax AI Server...")
+    print("set --env local to show camera frames in a window")
+
+    os.makedirs("data", exist_ok=True)
+    app.run(host="0.0.0.0", port=8336, threaded=True)
+
     try:
         psycopg2.connect(host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD).close()
     except:
         init_db()
     ensure_schema()
     start_periodic_db_logger(workers)
-
-    os.makedirs("data", exist_ok=True)
-    app.run(host="0.0.0.0", port=8000, threaded=True)
