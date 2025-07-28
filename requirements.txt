@@ -79,6 +79,7 @@ typing_extensions==4.14.0
 tzdata==2025.2
 ultralytics==8.3.165
 ultralytics-thop==2.0.14
+onnxruntime==1.17.0
 urllib3==2.4.0
 uvicorn==0.34.3
 watchfiles==1.0.5
