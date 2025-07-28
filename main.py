@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import json
 from ultralytics import YOLO
+import onnxruntime as ort
 from threading import Thread
 import time
 from flask import Flask, request, jsonify
@@ -50,7 +51,14 @@ class PessoaTracker:
     def __init__(self, camera_id, model_path, linha, direcao_entrada, inatividade_max=30):
         self.ultimo_salvamento = 0
         self.camera_id = camera_id
-        self.model = YOLO(model_path)
+        # Allow using ONNX models with onnxruntime
+        if model_path.lower().endswith(".onnx"):
+            self.model = YOLO(model_path)
+            # Force creation of an onnxruntime session so the dependency is loaded
+            self.ort_session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        else:
+            self.model = YOLO(model_path)
+            self.ort_session = None
         self.model.trackers = {"default": "botsort.yaml"}
         self.linha = linha
         self.direcao_entrada = direcao_entrada
